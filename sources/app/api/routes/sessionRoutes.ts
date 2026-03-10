@@ -1,11 +1,11 @@
-import { eventRouter, buildNewSessionUpdate } from "@/app/events/eventRouter";
+import { eventRouter, buildNewSessionUpdate, buildNewMessageUpdate } from "@/app/events/eventRouter";
 import { type Fastify } from "../types";
 import { db } from "@/storage/db";
 import { z } from "zod";
 import { Prisma } from "@prisma/client";
 import { log } from "@/utils/log";
 import { randomKeyNaked } from "@/utils/randomKeyNaked";
-import { allocateUserSeq } from "@/storage/seq";
+import { allocateUserSeq, allocateSessionSeq } from "@/storage/seq";
 import { sessionDelete } from "@/app/session/sessionDelete";
 
 export function sessionRoutes(app: Fastify) {
@@ -347,6 +347,131 @@ export function sessionRoutes(app: Fastify) {
                 id: v.id,
                 seq: v.seq,
                 content: v.content,
+                localId: v.localId,
+                createdAt: v.createdAt.getTime(),
+                updatedAt: v.updatedAt.getTime()
+            }))
+        });
+    });
+
+    // V3 Session Messages API - cursor-based with after_seq
+    app.get('/v3/sessions/:sessionId/messages', {
+        schema: {
+            params: z.object({
+                sessionId: z.string()
+            }),
+            querystring: z.object({
+                after_seq: z.coerce.number().int().min(0).default(0),
+                limit: z.coerce.number().int().min(1).max(200).default(100)
+            }).optional()
+        },
+        preHandler: app.authenticate
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const { sessionId } = request.params;
+        const { after_seq = 0, limit = 100 } = request.query || {};
+
+        const session = await db.session.findFirst({
+            where: { id: sessionId, accountId: userId }
+        });
+        if (!session) {
+            return reply.code(404).send({ error: 'Session not found' });
+        }
+
+        const messages = await db.sessionMessage.findMany({
+            where: { sessionId, seq: { gt: after_seq } },
+            orderBy: { seq: 'asc' },
+            take: limit + 1,
+            select: {
+                id: true,
+                seq: true,
+                localId: true,
+                content: true,
+                createdAt: true,
+                updatedAt: true
+            }
+        });
+
+        const hasMore = messages.length > limit;
+        const result = hasMore ? messages.slice(0, limit) : messages;
+
+        return reply.send({
+            messages: result.map((v) => ({
+                id: v.id,
+                seq: v.seq,
+                localId: v.localId,
+                content: v.content,
+                createdAt: v.createdAt.getTime(),
+                updatedAt: v.updatedAt.getTime()
+            })),
+            hasMore
+        });
+    });
+
+    // V3 Session Messages POST - send messages via HTTP
+    app.post('/v3/sessions/:sessionId/messages', {
+        schema: {
+            params: z.object({
+                sessionId: z.string()
+            }),
+            body: z.object({
+                messages: z.array(z.object({
+                    localId: z.string(),
+                    content: z.string()
+                }))
+            })
+        },
+        preHandler: app.authenticate
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const { sessionId } = request.params;
+        const { messages: incoming } = request.body;
+
+        const session = await db.session.findFirst({
+            where: { id: sessionId, accountId: userId }
+        });
+        if (!session) {
+            return reply.code(404).send({ error: 'Session not found' });
+        }
+
+        const created = [];
+        for (const incoming_msg of incoming) {
+            // Idempotency: check if message with this localId already exists
+            const existing = await db.sessionMessage.findFirst({
+                where: { sessionId, localId: incoming_msg.localId }
+            });
+            if (existing) {
+                created.push(existing);
+                continue;
+            }
+
+            const updSeq = await allocateUserSeq(userId);
+            const msgSeq = await allocateSessionSeq(sessionId);
+            const msgContent = { t: 'encrypted' as const, c: incoming_msg.content };
+
+            const msg = await db.sessionMessage.create({
+                data: {
+                    sessionId,
+                    seq: msgSeq,
+                    content: msgContent,
+                    localId: incoming_msg.localId
+                }
+            });
+
+            const updatePayload = buildNewMessageUpdate(msg, sessionId, updSeq, randomKeyNaked(12));
+            eventRouter.emitUpdate({
+                userId,
+                payload: updatePayload,
+                recipientFilter: { type: 'all-interested-in-session', sessionId }
+            });
+
+            created.push(msg);
+        }
+
+        return reply.send({
+            messages: created.map((v) => ({
+                id: v.id,
+                seq: v.seq,
                 localId: v.localId,
                 createdAt: v.createdAt.getTime(),
                 updatedAt: v.updatedAt.getTime()
